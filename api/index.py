@@ -12,7 +12,7 @@ app = Flask(__name__)
 TMDB_API_KEY = "b6a0ccf54e2f808390e4626b0e98ebd8"     # https://www.themoviedb.org/settings/api
 
 # Aggiorna quando StreamingCommunity cambia dominio
-SC_DOMAIN = "streamingunityz.support"
+SC_DOMAIN = "https://streaming-community.red/"
 # ──────────────────────────────────────────────────────────────────────────────
 
 SC_BASE = f"https://{SC_DOMAIN}"
