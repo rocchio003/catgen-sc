@@ -4,7 +4,6 @@ import threading
 import json
 from flask import Flask, jsonify, request as freq
 import requests
-from bs4 import BeautifulSoup
 
 app = Flask(__name__)
 
@@ -16,7 +15,6 @@ SC_DOMAIN = "streamingcommunityz.recipes"
 # ──────────────────────────────────────────────────────────────────────────────
 
 SC_BASE = f"https://{SC_DOMAIN}"
-SC_CDN  = f"https://cdn.{SC_DOMAIN}"
 
 SC_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -211,10 +209,7 @@ def _resolve_images(t: dict, media_type: str) -> dict:
     imgs  = _tmdb_images_by_title(title, year, tmdb_type)
     if imgs["poster"]:
         return imgs
-    def _sc_url(img_type):
-        fn = next((i["filename"] for i in t.get("images", []) if i.get("type") == img_type), None)
-        return f"{SC_CDN}/images/{fn}" if fn else None
-    return {"poster": _sc_url("poster"), "bg": _sc_url("background")}
+    return {"poster": None, "bg": None}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -486,7 +481,7 @@ def meta(content_type, meta_id):
                         "episode":   e["number"],
                         "title":     e.get("name") or f"Ep {e['number']}",
                         "released":  s.get("release_date") or t.get("release_date") or "",
-                        "thumbnail": f"{SC_CDN}/images/{ep_fn}" if ep_fn else "",
+                        "thumbnail": "",
                     })
             meta_data["videos"] = videos
 
