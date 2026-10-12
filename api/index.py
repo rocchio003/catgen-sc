@@ -1,17 +1,21 @@
+import os
 import re
+import html
+import json
 import time
 import threading
-import json
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, jsonify, request as freq
 import requests
 
 app = Flask(__name__)
 
 # ─── CONFIGURA QUI ─────────────────────────────────────────────────────────────
-TMDB_API_KEY = "b6a0ccf54e2f808390e4626b0e98ebd8"     # https://www.themoviedb.org/settings/api
+# Meglio impostarle come Environment Variables su Vercel; i valori sotto sono il fallback.
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "b6a0ccf54e2f808390e4626b0e98ebd8")  # https://www.themoviedb.org/settings/api
 
-# Aggiorna quando StreamingCommunity cambia dominio
-SC_DOMAIN = "streamingcommunityz.rip"
+# Aggiorna quando StreamingCommunity cambia dominio (oppure variabile SC_DOMAIN su Vercel)
+SC_DOMAIN = os.environ.get("SC_DOMAIN", "streamingcommunityz.rip")
 # ──────────────────────────────────────────────────────────────────────────────
 
 SC_BASE = f"https://{SC_DOMAIN}"
@@ -26,7 +30,7 @@ SC_HEADERS = {
 _img_cache:   dict = {}
 _imdb_cache:  dict = {}
 _imdb_to_src: dict = {}
-_session:     dict = {"cookie": "", "xsrf": "", "version": "", "ts": 0}
+_session:     dict = {"http": None, "xsrf": "", "version": "", "ts": 0}
 _cache_lock = threading.Lock()
 SESSION_TTL = 15 * 60
 
@@ -54,46 +58,65 @@ SECTION_MAP = {
     "upcoming": "Prossimamente",
 }
 
+RETRY_STATUS = (401, 403, 409, 419)
+
+
+def _json_resp(payload: dict):
+    resp = jsonify(payload)
+    resp.headers.add("Access-Control-Allow-Origin", "*")
+    return resp
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SESSION
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _parse_page(text: str) -> dict | None:
+    m = re.search(r'data-page="([^"]*)"', text)
+    if not m:
+        return None
+    return json.loads(html.unescape(m.group(1)))
+
+
 def _ensure_session(force: bool = False):
     now = time.time()
-    if not force and _session["cookie"] and _session["version"] and now - _session["ts"] < SESSION_TTL:
+    if not force and _session["http"] and _session["version"] and now - _session["ts"] < SESSION_TTL:
         return
-    r1 = requests.get(f"{SC_BASE}/it", headers=SC_HEADERS, timeout=15)
-    m  = re.search(r'data-page="([^"]*)"', r1.text)
-    if not m:
-        raise RuntimeError("SC: data-page non trovato")
-    page_data = json.loads(m.group(1).replace("&quot;", '"').replace("&amp;", "&"))
-    version   = page_data.get("version", "")
-    c1        = "; ".join(c.split(";")[0] for c in r1.headers.get("Set-Cookie", "").split(", ") if "=" in c.split(";")[0])
-    r2 = requests.get(
-        f"{SC_BASE}/sanctum/csrf-cookie",
-        headers={**SC_HEADERS, "Referer": f"{SC_BASE}/it/", "Cookie": c1},
-        timeout=10
-    )
-    all_cookies = []
-    for h in [r1.headers, r2.headers]:
-        raw = h.get("Set-Cookie", "")
-        if raw:
-            for part in raw.split(", "):
-                kv = part.split(";")[0]
-                if "=" in kv:
-                    all_cookies.append(kv)
-    cookie_str = "; ".join(all_cookies)
+    s = requests.Session()
+    s.headers.update(SC_HEADERS)
+    r1 = s.get(f"{SC_BASE}/it", timeout=15)
+    page = _parse_page(r1.text)
+    if page is None:
+        raise RuntimeError(
+            f"SC: data-page non trovato (HTTP {r1.status_code}, server={r1.headers.get('server')}, url finale={r1.url})"
+        )
+    version = page.get("version", "")
+    s.get(f"{SC_BASE}/sanctum/csrf-cookie", headers={"Referer": f"{SC_BASE}/it/"}, timeout=10)
     xsrf = ""
-    for c in all_cookies:
-        if c.startswith("XSRF-TOKEN="):
-            xsrf = requests.utils.unquote(c.split("=", 1)[1])
+    for c in s.cookies:
+        if c.name == "XSRF-TOKEN":
+            xsrf = requests.utils.unquote(c.value)
             break
     with _cache_lock:
-        _session["cookie"]  = cookie_str
+        _session["http"]    = s
         _session["xsrf"]    = xsrf
         _session["version"] = version
         _session["ts"]      = now
+
+
+def _post_sliders(chunk: list):
+    return _session["http"].post(
+        f"{SC_BASE}/api/sliders/fetch?lang=it",
+        headers={
+            "X-XSRF-TOKEN":      _session["xsrf"],
+            "X-Inertia-Version": _session["version"],
+            "Origin":            SC_BASE,
+            "Accept":            "application/json, text/plain, */*",
+            "Content-Type":      "application/json",
+        },
+        json={"sliders": chunk},
+        timeout=15
+    )
 
 
 def _fetch_sliders(slider_requests: list) -> list:
@@ -102,42 +125,50 @@ def _fetch_sliders(slider_requests: list) -> list:
     for i in range(0, len(slider_requests), 6):
         chunk = slider_requests[i:i+6]
         try:
-            r = requests.post(
-                f"{SC_BASE}/api/sliders/fetch?lang=it",
-                headers={
-                    **SC_HEADERS,
-                    "Cookie":            _session["cookie"],
-                    "X-XSRF-TOKEN":      _session["xsrf"],
-                    "X-Inertia-Version": _session["version"],
-                    "Origin":            SC_BASE,
-                    "Accept":            "application/json, text/plain, */*",
-                    "Content-Type":      "application/json",
-                },
-                json={"sliders": chunk},
-                timeout=15
-            )
+            r = _post_sliders(chunk)
+            if r.status_code in RETRY_STATUS:
+                _ensure_session(force=True)
+                r = _post_sliders(chunk)
             if r.status_code == 200:
                 body = r.text.strip()
                 if body.startswith("["):
                     all_results.extend(json.loads(body))
+                else:
+                    print(f"[SC sliders] risposta non-JSON: {body[:150]}")
+            else:
+                print(f"[SC sliders] HTTP {r.status_code}: {r.text[:150]}")
         except Exception as e:
             print(f"[SC sliders] {e}")
     return all_results
 
 
-def _fetch_title_detail(title_id: str, slug: str) -> dict | None:
+def _inertia_get(url: str):
     _ensure_session()
+    r = None
+    for attempt in range(2):
+        r = _session["http"].get(
+            url,
+            headers={
+                "X-Inertia":         "true",
+                "X-Inertia-Version": _session["version"],
+                "Accept":            "application/json",
+            },
+            timeout=15
+        )
+        if r.status_code in RETRY_STATUS and attempt == 0:
+            _ensure_session(force=True)
+            continue
+        break
+    return r
+
+
+def _fetch_title_detail(title_id: str, slug: str) -> dict | None:
     url = f"{SC_BASE}/it/titles/{title_id}-{slug}" if slug else f"{SC_BASE}/it/titles/{title_id}"
     try:
-        r = requests.get(url, headers={
-            **SC_HEADERS,
-            "Cookie":            _session["cookie"],
-            "X-Inertia":         "true",
-            "X-Inertia-Version": _session["version"],
-            "Accept":            "application/json",
-        }, timeout=15)
+        r = _inertia_get(url)
         if r.status_code == 200:
             return r.json()
+        print(f"[SC detail] HTTP {r.status_code}")
     except Exception as e:
         print(f"[SC detail] {e}")
     return None
@@ -146,6 +177,16 @@ def _fetch_title_detail(title_id: str, slug: str) -> dict | None:
 # ═════════════════════════════════════════════════════════════════════════════
 # TMDB IMMAGINI
 # ═════════════════════════════════════════════════════════════════════════════
+
+NO_IMGS = {"poster": None, "bg": None}
+
+
+def _imgs_from(data: dict) -> dict:
+    return {
+        "poster": f"https://image.tmdb.org/t/p/w500{data['poster_path']}"    if data.get("poster_path")   else None,
+        "bg":     f"https://image.tmdb.org/t/p/w1280{data['backdrop_path']}"  if data.get("backdrop_path") else None,
+    }
+
 
 def _tmdb_images_by_id(tmdb_id: int, tmdb_type: str) -> dict:
     cache_key = f"id:{tmdb_type}:{tmdb_id}"
@@ -156,17 +197,15 @@ def _tmdb_images_by_id(tmdb_id: int, tmdb_type: str) -> dict:
         r = requests.get(
             f"https://api.themoviedb.org/3/{tmdb_type}/{tmdb_id}",
             params={"api_key": TMDB_API_KEY, "language": "it-IT"},
-            timeout=5
+            timeout=8
         )
-        data = r.json()
-        result = {
-            "poster": f"https://image.tmdb.org/t/p/w500{data['poster_path']}"    if data.get("poster_path")   else None,
-            "bg":     f"https://image.tmdb.org/t/p/w1280{data['backdrop_path']}"  if data.get("backdrop_path") else None,
-        }
+        if r.status_code != 200:
+            print(f"[TMDB img id] {tmdb_id}: HTTP {r.status_code}")
+            return dict(NO_IMGS)  # non in cache: riprova alla prossima richiesta
+        result = _imgs_from(r.json())
     except Exception as e:
         print(f"[TMDB img id] {tmdb_id}: {e}")
-        result = {"poster": None, "bg": None}
-    time.sleep(0.05)
+        return dict(NO_IMGS)
     with _cache_lock:
         _img_cache[cache_key] = result
     return result
@@ -182,17 +221,15 @@ def _tmdb_images_by_title(title: str, year: str | None, tmdb_type: str) -> dict:
         params = {"api_key": TMDB_API_KEY, "query": clean, "language": "it-IT"}
         if year:
             params["year" if tmdb_type == "movie" else "first_air_date_year"] = year
-        r       = requests.get(f"https://api.themoviedb.org/3/search/{tmdb_type}", params=params, timeout=5)
+        r = requests.get(f"https://api.themoviedb.org/3/search/{tmdb_type}", params=params, timeout=8)
+        if r.status_code != 200:
+            print(f"[TMDB img search] '{title}': HTTP {r.status_code}")
+            return dict(NO_IMGS)
         results = r.json().get("results", [])
-        first   = results[0] if results else {}
-        result  = {
-            "poster": f"https://image.tmdb.org/t/p/w500{first['poster_path']}"    if first.get("poster_path")   else None,
-            "bg":     f"https://image.tmdb.org/t/p/w1280{first['backdrop_path']}"  if first.get("backdrop_path") else None,
-        }
+        result  = _imgs_from(results[0] if results else {})
     except Exception as e:
         print(f"[TMDB img search] '{title}': {e}")
-        result = {"poster": None, "bg": None}
-    time.sleep(0.05)
+        return dict(NO_IMGS)
     with _cache_lock:
         _img_cache[cache_key] = result
     return result
@@ -205,11 +242,10 @@ def _resolve_images(t: dict, media_type: str) -> dict:
         imgs = _tmdb_images_by_id(t["tmdb_id"], tmdb_type)
         if imgs["poster"]:
             return imgs
-    title = t.get("name", "")
-    imgs  = _tmdb_images_by_title(title, year, tmdb_type)
+    imgs = _tmdb_images_by_title(t.get("name", ""), year, tmdb_type)
     if imgs["poster"]:
         return imgs
-    return {"poster": None, "bg": None}
+    return dict(NO_IMGS)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -224,15 +260,17 @@ def _tmdb_to_imdb(tmdb_id: int, tmdb_type: str) -> str | None:
         if cache_key in _imdb_cache:
             return _imdb_cache[cache_key]
     try:
-        r       = requests.get(
+        r = requests.get(
             f"https://api.themoviedb.org/3/{tmdb_type}/{tmdb_id}/external_ids",
-            params={"api_key": TMDB_API_KEY}, timeout=5
+            params={"api_key": TMDB_API_KEY}, timeout=8
         )
-        imdb_id = r.json().get("imdb_id")
+        if r.status_code != 200:
+            print(f"[TMDB ext_ids] {tmdb_id}: HTTP {r.status_code}")
+            return None
+        imdb_id = r.json().get("imdb_id") or None
     except Exception as e:
         print(f"[TMDB ext_ids] {tmdb_id}: {e}")
-        imdb_id = None
-    time.sleep(0.05)
+        return None
     with _cache_lock:
         _imdb_cache[cache_key] = imdb_id
     return imdb_id
@@ -248,13 +286,15 @@ def _tmdb_search_imdb(title: str, year: str | None, tmdb_type: str) -> str | Non
         params = {"api_key": TMDB_API_KEY, "query": clean, "language": "it-IT"}
         if year:
             params["year" if tmdb_type == "movie" else "first_air_date_year"] = year
-        r       = requests.get(f"https://api.themoviedb.org/3/search/{tmdb_type}", params=params, timeout=5)
+        r = requests.get(f"https://api.themoviedb.org/3/search/{tmdb_type}", params=params, timeout=8)
+        if r.status_code != 200:
+            print(f"[TMDB search imdb] '{title}': HTTP {r.status_code}")
+            return None
         results = r.json().get("results", [])
         imdb_id = _tmdb_to_imdb(results[0]["id"], tmdb_type) if results else None
     except Exception as e:
         print(f"[TMDB search imdb] '{title}': {e}")
-        imdb_id = None
-    time.sleep(0.05)
+        return None
     with _cache_lock:
         _imdb_cache[cache_key] = imdb_id
     return imdb_id
@@ -304,10 +344,20 @@ def _build_meta(t: dict) -> dict | None:
     }
 
 
+def _build_meta_safe(t: dict) -> dict | None:
+    try:
+        return _build_meta(t)
+    except Exception as e:
+        print(f"[build_meta] {e}")
+        return None
+
+
 def _shows_to_metas(shows: list) -> list:
+    # Chiamate TMDB in parallelo: su Vercel il tempo massimo della funzione è limitato
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        built = list(ex.map(_build_meta_safe, shows))
     metas, seen = [], set()
-    for t in shows:
-        meta = _build_meta(t)
+    for meta in built:
         if meta and meta["id"] not in seen:
             seen.add(meta["id"])
             metas.append(meta)
@@ -343,9 +393,7 @@ def manifest():
         "catalogs":    catalogs,
         "idPrefixes":  ["tt", "cg"],
     }
-    resp = jsonify(data)
-    resp.headers.add("Access-Control-Allow-Origin", "*")
-    return resp
+    return _json_resp(data)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -358,14 +406,13 @@ def catalog(content_type, catalog_id):
     if search_query:
         try:
             _ensure_session()
-            r    = requests.get(
+            r = _session["http"].get(
                 f"{SC_BASE}/it/search?q={requests.utils.quote(search_query)}",
-                headers={**SC_HEADERS, "Cookie": _session["cookie"]}, timeout=15
+                timeout=15
             )
-            m     = re.search(r'data-page="([^"]*)"', r.text)
+            d     = _parse_page(r.text)
             shows = []
-            if m:
-                d     = json.loads(m.group(1).replace("&quot;", '"').replace("&amp;", "&"))
+            if d:
                 shows = [t for t in d.get("props", {}).get("titles", []) if t.get("type") in ("movie", "tv")]
                 if content_type == "series":
                     shows = [t for t in shows if t.get("type") == "tv"]
@@ -375,9 +422,7 @@ def catalog(content_type, catalog_id):
         except Exception as e:
             print(f"[search] {e}")
             metas = []
-        resp = jsonify({"metas": metas})
-        resp.headers.add("Access-Control-Allow-Origin", "*")
-        return resp
+        return _json_resp({"metas": metas})
 
     if catalog_id.startswith("genre_"):
         genre      = catalog_id.replace("genre_", "")
@@ -400,9 +445,10 @@ def catalog(content_type, catalog_id):
         print(f"[catalog] {e}")
         metas = []
 
-    resp = jsonify({"metas": metas, "cacheMaxAge": 1800})
-    resp.headers.add("Access-Control-Allow-Origin", "*")
-    return resp
+    payload = {"metas": metas}
+    if metas:
+        payload["cacheMaxAge"] = 1800  # non far cachare ai client un risultato vuoto
+    return _json_resp(payload)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -419,17 +465,13 @@ def meta(content_type, meta_id):
         else:
             src = _imdb_to_src.get(meta_id)
             if not src:
-                resp = jsonify({"meta": None})
-                resp.headers.add("Access-Control-Allow-Origin", "*")
-                return resp
+                return _json_resp({"meta": None})
             title_id = src["id"]
             slug     = src["slug"]
 
         data = _fetch_title_detail(title_id, slug)
         if not data or not data.get("props", {}).get("title"):
-            resp = jsonify({"meta": None})
-            resp.headers.add("Access-Control-Allow-Origin", "*")
-            return resp
+            return _json_resp({"meta": None})
 
         t          = data["props"]["title"]
         media_type = "series" if t.get("type") == "tv" else "movie"
@@ -462,19 +504,12 @@ def meta(content_type, meta_id):
                     episodes = loaded.get("episodes", [])
                 else:
                     try:
-                        r2 = requests.get(
-                            f"{SC_BASE}/it/titles/{t['id']}-{t['slug']}/season-{s['number']}",
-                            headers={**SC_HEADERS, "Cookie": _session["cookie"],
-                                     "X-Inertia": "true", "X-Inertia-Version": _session["version"],
-                                     "Accept": "application/json"},
-                            timeout=15
-                        )
+                        r2 = _inertia_get(f"{SC_BASE}/it/titles/{t['id']}-{t['slug']}/season-{s['number']}")
                         if r2.status_code == 200:
                             episodes = r2.json().get("props", {}).get("loadedSeason", {}).get("episodes", [])
                     except Exception:
                         pass
                 for e in (episodes or []):
-                    ep_fn = next((i["filename"] for i in e.get("images", []) if i.get("type") == "cover"), None)
                     videos.append({
                         "id":        f"{meta_id}:S{s['number']}E{e['number']}",
                         "season":    s["number"],
@@ -489,31 +524,57 @@ def meta(content_type, meta_id):
         print(f"[meta] {e}")
         meta_data = None
 
-    resp = jsonify({"meta": meta_data})
-    resp.headers.add("Access-Control-Allow-Origin", "*")
-    return resp
+    return _json_resp({"meta": meta_data})
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# DEBUG
+# DEBUG  →  apri  https://TUO-PROGETTO.vercel.app/debug/sc
 # ═════════════════════════════════════════════════════════════════════════════
 
 @app.route("/debug/sc")
 def debug_sc():
+    out = {"domain": SC_DOMAIN}
+
+    # 1) La home di SC è raggiungibile da Vercel?
+    try:
+        r   = requests.get(f"{SC_BASE}/it", headers=SC_HEADERS, timeout=15)
+        txt = r.text
+        out["home"] = {
+            "status":               r.status_code,
+            "final_url":            r.url,
+            "server":               r.headers.get("server"),
+            "data_page_found":      'data-page="' in txt,
+            "cloudflare_challenge": any(k in txt for k in ("Just a moment", "cf-chl", "challenge-platform", "cf-turnstile")),
+            "snippet":              re.sub(r"\s+", " ", txt[:200]),
+        }
+    except Exception as e:
+        out["home"] = {"error": str(e)}
+
+    # 2) Sessione + sliders
     try:
         _ensure_session(force=True)
-        return jsonify({
-            "domain":  SC_DOMAIN,
-            "version": _session["version"],
-            "status":  "ok"
-        })
+        out["session"] = {"status": "ok", "version": _session["version"], "xsrf": bool(_session["xsrf"])}
+        r = _post_sliders([{"name": "top10", "genre": None}])
+        body = r.text.strip()
+        n = 0
+        if r.status_code == 200 and body.startswith("["):
+            n = sum(len(s.get("titles", [])) for s in json.loads(body))
+        out["sliders"] = {"status": r.status_code, "titles": n, "snippet": body[:120] if n == 0 else ""}
     except Exception as e:
-        return jsonify({"error": str(e)})
+        out["session"] = {"error": str(e)}
+
+    # 3) TMDB risponde con la chiave attuale?
+    try:
+        r = requests.get("https://api.themoviedb.org/3/configuration", params={"api_key": TMDB_API_KEY}, timeout=8)
+        out["tmdb"] = {"status": r.status_code}
+    except Exception as e:
+        out["tmdb"] = {"error": str(e)}
+
+    return jsonify(out)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 3000))
     app.run(host="0.0.0.0", port=port)
