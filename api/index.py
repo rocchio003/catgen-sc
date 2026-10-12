@@ -8,6 +8,11 @@ from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, jsonify, request as freq
 import requests
 
+try:  # impersona l'impronta TLS di Chrome (aggira i blocchi di Cloudflare basati su python-requests)
+    from curl_cffi import requests as cffi_requests
+except Exception:
+    cffi_requests = None
+
 app = Flask(__name__)
 
 # ─── CONFIGURA QUI ─────────────────────────────────────────────────────────────
@@ -17,6 +22,9 @@ TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "b6a0ccf54e2f808390e4626b0e98ebd8"
 # Aggiorna quando StreamingCommunity cambia dominio (oppure variabile SC_DOMAIN su Vercel)
 SC_DOMAIN = os.environ.get("SC_DOMAIN", "streamingcommunityz.rip")
 # ──────────────────────────────────────────────────────────────────────────────
+
+# Opzionale: proxy HTTP(S) se Cloudflare blocca l'IP del server, es. http://user:pass@host:porta
+PROXY_URL = os.environ.get("PROXY_URL", "")
 
 SC_BASE = f"https://{SC_DOMAIN}"
 
@@ -71,6 +79,18 @@ def _json_resp(payload: dict):
 # SESSION
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _new_http():
+    if cffi_requests is not None:
+        s = cffi_requests.Session(impersonate="chrome124")
+        s.headers.update({k: v for k, v in SC_HEADERS.items() if k != "User-Agent"})
+    else:
+        s = requests.Session()
+        s.headers.update(SC_HEADERS)
+    if PROXY_URL:
+        s.proxies = {"http": PROXY_URL, "https": PROXY_URL}
+    return s
+
+
 def _parse_page(text: str) -> dict | None:
     m = re.search(r'data-page="([^"]*)"', text)
     if not m:
@@ -82,8 +102,7 @@ def _ensure_session(force: bool = False):
     now = time.time()
     if not force and _session["http"] and _session["version"] and now - _session["ts"] < SESSION_TTL:
         return
-    s = requests.Session()
-    s.headers.update(SC_HEADERS)
+    s = _new_http()
     r1 = s.get(f"{SC_BASE}/it", timeout=15)
     page = _parse_page(r1.text)
     if page is None:
@@ -92,11 +111,10 @@ def _ensure_session(force: bool = False):
         )
     version = page.get("version", "")
     s.get(f"{SC_BASE}/sanctum/csrf-cookie", headers={"Referer": f"{SC_BASE}/it/"}, timeout=10)
-    xsrf = ""
-    for c in s.cookies:
-        if c.name == "XSRF-TOKEN":
-            xsrf = requests.utils.unquote(c.value)
-            break
+    try:
+        xsrf = requests.utils.unquote(s.cookies.get("XSRF-TOKEN") or "")
+    except Exception:
+        xsrf = ""
     with _cache_lock:
         _session["http"]    = s
         _session["xsrf"]    = xsrf
@@ -535,17 +553,22 @@ def meta(content_type, meta_id):
 def debug_sc():
     out = {"domain": SC_DOMAIN}
 
-    # 1) La home di SC è raggiungibile da Vercel?
+    # 1) La home di SC è raggiungibile da questo server?
+    out["impersonate_chrome"] = cffi_requests is not None
+    out["proxy"] = bool(PROXY_URL)
     try:
-        r   = requests.get(f"{SC_BASE}/it", headers=SC_HEADERS, timeout=15)
+        r   = _new_http().get(f"{SC_BASE}/it", timeout=15)
         txt = r.text
+        title = re.search(r"<title>(.*?)</title>", txt, re.S | re.I)
+        code  = re.search(r"(?:Error code|Error)\s*:?\s*(\d{4})", txt)
         out["home"] = {
             "status":               r.status_code,
-            "final_url":            r.url,
+            "final_url":            str(r.url),
             "server":               r.headers.get("server"),
             "data_page_found":      'data-page="' in txt,
             "cloudflare_challenge": any(k in txt for k in ("Just a moment", "cf-chl", "challenge-platform", "cf-turnstile")),
-            "snippet":              re.sub(r"\s+", " ", txt[:200]),
+            "page_title":           re.sub(r"\s+", " ", title.group(1)).strip() if title else "",
+            "cloudflare_error":     code.group(1) if code else "",
         }
     except Exception as e:
         out["home"] = {"error": str(e)}
