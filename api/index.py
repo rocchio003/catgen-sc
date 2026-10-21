@@ -20,7 +20,7 @@ app = Flask(__name__)
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "b6a0ccf54e2f808390e4626b0e98ebd8")  # https://www.themoviedb.org/settings/api
 
 # Aggiorna quando StreamingCommunity cambia dominio (oppure variabile SC_DOMAIN su Vercel)
-SC_DOMAIN = os.environ.get("SC_DOMAIN", "streamingcommunityz.shiksha")
+SC_DOMAIN = os.environ.get("SC_DOMAIN", "streamingcommunityz.build")
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Opzionale: proxy HTTP(S) se Cloudflare blocca l'IP del server, es. http://user:pass@host:porta
